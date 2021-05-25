@@ -3,7 +3,7 @@
 use codec::{Encode, Decode};
 use frame_support::{
 	decl_module, decl_storage, decl_event, decl_error, ensure,StorageValue, StorageDoubleMap,
-	traits::Randomness, RuntimeDebug, dispatch::{DispatchError, DispatchResult},
+	traits::Randomness, RuntimeDebug, dispatch::DispatchError, 
 };
 use sp_io::hashing::blake2_128;
 use frame_system::ensure_signed;
@@ -73,32 +73,16 @@ decl_module! {
 		pub fn create(origin) {
 			let sender = ensure_signed(origin)?;
 
-			// TODO: refactor this method to use the
-			// `Self::random_value` and `Self::get_next_kitty_id`
-			// to simplify the implementation
+			let kitty_id = Self::get_next_kitty_id()?;
 
-			// Error check on Kitty ID overflow detection
-			NextKittyId::try_mutate(|next_kitty_id| -> DispatchResult {
-				let kitty_id = *next_kitty_id;
-				*next_kitty_id = next_kitty_id.checked_add(1).ok_or(Error::<T>::KittiesIdOverflow)?;
+			let dna = Self::random_value(&sender);
 
-				// Generate a random 128bit value
-				let payload = (
-					<pallet_randomness_collective_flip::Module<T> as Randomness<T::Hash>>::random_seed(),
-					&sender,
-					<frame_system::Module<T>>::extrinsic_index(),
-				);
-				let dna = payload.using_encoded(blake2_128);
+			// Create and store Kitty
+			let kitty = Kitty(dna);
+			Kitties::<T>::insert(&sender, kitty_id, &kitty);
 
-				// Create and store kitty
-				let kitty = Kitty(dna);
-				Kitties::<T>::insert(&sender, kitty_id, &kitty);
-	
-				// Emit event
-				Self::deposit_event(RawEvent::KittyCreated(sender, kitty_id, kitty));
-
-				Ok(())
-			})?;
+			// Emit event
+			Self::deposit_event(RawEvent::KittyCreated(sender, kitty_id, kitty));
 		}
 
 		/// Breed kitties
@@ -133,15 +117,12 @@ decl_module! {
 }
 
 pub fn combine_dna(dna_1: u8, dna_2: u8, selector: u8) -> u8 {
-	// TODO: finish this implementation
-	// selector[bit_index] == 0 -> use dna_1[bit_index]
 	// selector[bit_index] == 1 -> use dna_2[bit_index]
 	// e.g.
 	// selector = 0b00000001
 	// dna_1	= 0b10101010
 	// dna_2	= 0b00001111
-	// result	= 0b10101011
-	0
+	(!selector &dna_1) | (selector & dna_2)
 }
 
 impl<T: Config> Module<T> {
@@ -155,7 +136,11 @@ impl<T: Config> Module<T> {
 	}
 
 	fn random_value(sender: &T::AccountId) -> [u8; 16] {
-		// TODO: finish this implementation
-		Default::default()
+		let payload = (
+			<pallet_randomness_collective_flip::Module<T> as Randomness<T::Hash>>::random_seed(),
+			&sender,
+			<frame_system::Module<T>>::extrinsic_index(),
+		);
+		payload.using_encoded(blake2_128)
 	}
-}
+}	
