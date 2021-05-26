@@ -1,6 +1,7 @@
 use super::*;
 
 use crate as kitties;
+use std::cell::RefCell;
 use sp_core::H256;
 use frame_support::{parameter_types, assert_ok, assert_noop};
 use sp_runtime::{
@@ -52,8 +53,26 @@ impl frame_system::Config for Test {
     type SS58Prefix = SS58Prefix;
 }
 
+thread_local! {
+    static RANDOM_PAYLOAD: RefCell<H256> = RefCell::new(Default::default());
+}
+
+pub struct MockRandom;
+
+impl Randomness<H256> for MockRandom {
+    fn random(_subject: &[u8]) -> H256 {
+        RANDOM_PAYLOAD.with(|v| *v.borrow())
+    }
+}
+
+fn set_random(val: H256) {
+    RANDOM_PAYLOAD.with(|v| *v.borrow_mut() = val)
+}
+
 impl Config for Test {
     type Event = Event;
+    type Randomness = MockRandom;
+    type KittyIndex = u32;
 }
 
 // Build genesis storage according to the mock runtime
@@ -92,7 +111,7 @@ fn can_breed() {
     new_test_ext().execute_with(|| {
         assert_ok!(KittiesModule::create(Origin::signed(100)));
 
-        System::set_extrinsic_index(1);
+        set_random(H256::from([2; 32]));
 
         assert_ok!(KittiesModule::create(Origin::signed(100)));
 
@@ -116,3 +135,5 @@ fn combine_dna_works() {
     assert_eq!(combine_dna(0b11111111, 0b00000000, 0b00001111), 0b11110000);
 	assert_eq!(combine_dna(0b10101010, 0b11110000, 0b11001100), 0b11100010);
 }
+
+// TODO: add new test cases for `fn transfer`. Make sure you have covered all edge cases
