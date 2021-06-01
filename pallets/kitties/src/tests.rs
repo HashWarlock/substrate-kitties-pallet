@@ -136,4 +136,40 @@ fn combine_dna_works() {
 	assert_eq!(combine_dna(0b10101010, 0b11110000, 0b11001100), 0b11100010);
 }
 
-// TODO: add new test cases for `fn transfer`. Make sure you have covered all edge cases
+#[test]
+fn can_transfer() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(KittiesModule::create(Origin::signed(100)));
+
+        assert_noop!(KittiesModule::transfer(Origin::signed(101), 200, 0), Error::<Test>::InvalidKittyId);
+
+        assert_ok!(KittiesModule::transfer(Origin::signed(100), 200, 0));
+
+        let kitty = Kitty([59, 250, 138, 82, 209, 39, 141, 109, 163, 238, 183, 145, 235, 168, 18, 122]);
+
+        assert_eq!(KittiesModule::kitties(200, 0), Some(kitty));
+        assert_eq!(Kitties::<Test>::contains_key(100, 0), false);
+
+        assert_eq!(last_event(), Event::kitties(RawEvent::KittyTransferred(100, 200, 0)));
+    });
+}
+
+#[test]
+fn handle_self_transfer() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(KittiesModule::create(Origin::signed(100)));
+
+        System::reset_events();
+
+        assert_noop!(KittiesModule::transfer(Origin::signed(100), 100, 1), Error::<Test>::InvalidKittyId);
+
+        assert_ok!(KittiesModule::transfer(Origin::signed(100), 100, 0));
+
+        let kitty = Kitty([59, 250, 138, 82, 209, 39, 141, 109, 163, 238, 183, 145, 235, 168, 18, 122]);
+
+        assert_eq!(KittiesModule::kitties(100, 0), Some(kitty));
+
+        // no transfer event because no actual transfer is executed
+        assert_eq!(System::events().len(), 0);
+    });
+}
