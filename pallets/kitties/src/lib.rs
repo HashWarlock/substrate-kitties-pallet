@@ -2,16 +2,22 @@
 
 use codec::{Encode, Decode};
 use frame_support::{
-	decl_module, decl_storage, decl_event, decl_error, ensure, StorageValue, StorageDoubleMap, Parameter,
-	traits::Randomness, RuntimeDebug, dispatch::{DispatchError, DispatchResult}, 
+	decl_module, decl_storage, decl_event, decl_error, ensure, StorageValue,
+	traits::{Randomness, Currency, ExistenceRequirement}, RuntimeDebug, dispatch::DispatchResult, 
 };
 use sp_io::hashing::blake2_128;
 use frame_system::ensure_signed;
-use sp_runtime::traits::{AtLeast32BitUnsigned, Bounded, One, CheckedAdd};
+use sp_std::vec::Vec;
+use orml_utilities::with_transaction_result;
+use orml_nft::Module as NftModule;
+#[cfg(feature = "std")]
+use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
 mod tests;
 
+
+#[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
 #[derive(Encode, Decode, Clone, RuntimeDebug, PartialEq, Eq)]
 pub struct Kitty(pub [u8; 16]);
 
@@ -31,25 +37,36 @@ impl Kitty {
 	}
 }
 
-pub trait Config: frame_system::Config {
+pub trait Config: orml_nft::Config<TokenData = Kitty, ClassData = ()> {
 	type Event: From<Event<Self>> + Into<<Self as frame_system::Config>::Event>;
 	type Randomness: Randomness<Self::Hash>;
-	type KittyIndex: Parameter + AtLeast32BitUnsigned + Bounded + Default + Copy;
+	type Currency: Currency<Self::AccountId>;
 }
+
+type KittyIndexOf<T> = <T as orml_nft::Config>::TokenId;
+type BalanceOf<T> = <<T as Config>::Currency as Currency<<T as frame_system::Config>::AccountId>>::Balance;
 
 decl_storage! {
 	trait Store for Module<T: Config> as Kitties {
-		/// Stores all the kitties, key is the kitty id
-		pub Kitties get(fn kitties): double_map hasher(blake2_128_concat) T::AccountId, hasher(blake2_128_concat) T::KittyIndex => Option<Kitty>;
-		/// Stores the next kitty ID
-		pub NextKittyId get(fn next_kitty_id): T::KittyIndex;
+		/// Get kitty price. None means not for sale
+		pub KittyPrices get(fn kitty_prices): map hasher(blake2_128_concat) KittyIndexOf<T> => Option<BalanceOf<T>>;
+		/// The class id for orml_nft
+		pub ClassId get(fn class_id): T::ClassId;
+	}
+	add_extra_genesis {
+		build(|_config| {
+			// create a NFT class
+			let class_id = NftModule::<T>::create_class(&Default::default(), Vec::new(), ()).expect("Cannot fail or invalid chain spec");
+			ClassId::<T>::put(class_id);
+		})
 	}
 }
 
 decl_event! {
 	pub enum Event<T> where
 		<T as frame_system::Config>::AccountId,
-		<T as Config>::KittyIndex,
+		KittyIndex = KittyIndexOf<T>,
+		Balance = BalanceOf<T>,
 	{
 		/// A kitty is created. \[owner, kitty_id, kitty\]
 		KittyCreated(AccountId, KittyIndex, Kitty),
@@ -57,14 +74,21 @@ decl_event! {
 		KittyBred(AccountId, KittyIndex, Kitty),
 		/// A kitty is transferred. \[from, to, kitty_id\]
 		KittyTransferred(AccountId, AccountId, KittyIndex),
+		/// The price for a kitty is updated. \[ownder, kitty_id, price\]
+		KittyPriceUpdated(AccountId, KittyIndex, Option<Balance>),
+		/// A kitty is sold. \[old_owner, new_owner, kitty_id, price\]
+		KittySold(AccountId, AccountId, KittyIndex, Balance),
 	}
 }
 
 decl_error! {
 	pub enum Error for Module<T: Config> {
-		KittiesIdOverflow,
 		InvalidKittyId,
 		SameGender,
+		NotOwner,
+		NotForSale,
+		PriceTooLow,
+		BuyFromSelf,
 	}
 }
 
@@ -78,14 +102,11 @@ decl_module! {
 		#[weight = 1000]
 		pub fn create(origin) {
 			let sender = ensure_signed(origin)?;
-
-			let kitty_id = Self::get_next_kitty_id()?;
-
 			let dna = Self::random_value(&sender);
 
 			// Create and store Kitty
 			let kitty = Kitty(dna);
-			Kitties::<T>::insert(&sender, kitty_id, &kitty);
+			let kitty_id = NftModule::<T>::mint(&sender, Self::class_id(), Vec::new(), kitty.clone())?;
 
 			// Emit event
 			Self::deposit_event(RawEvent::KittyCreated(sender, kitty_id, kitty));
@@ -93,15 +114,13 @@ decl_module! {
 
 		/// Breed kitties
 		#[weight = 1000]
-		pub fn breed(origin, kitty_id_1: T::KittyIndex, kitty_id_2: T::KittyIndex) {
+		pub fn breed(origin, kitty_id_1: KittyIndexOf<T>, kitty_id_2: KittyIndexOf<T>) {
 			let sender = ensure_signed(origin)?;
 			let kitty_1 = Self::kitties(&sender, kitty_id_1).ok_or(Error::<T>::InvalidKittyId)?;
 			let kitty_2 = Self::kitties(&sender, kitty_id_2).ok_or(Error::<T>::InvalidKittyId)?;
 
 			ensure!(kitty_1.gender() != kitty_2.gender(), Error::<T>::SameGender);
 
-			let kitty_id = Self::get_next_kitty_id()?;
-			
 			let kitty_1_dna = kitty_1.0;
 			let kitty_2_dna = kitty_2.0;
 
@@ -115,29 +134,57 @@ decl_module! {
 
 			let new_kitty = Kitty(new_dna);
 
-			Kitties::<T>::insert(&sender, kitty_id, &new_kitty);
+			let kitty_id = NftModule::<T>::mint(&sender, Self::class_id(), Vec::new(), new_kitty.clone())?;
 
 			Self::deposit_event(RawEvent::KittyBred(sender, kitty_id, new_kitty));
 		}
 
 		/// Transfer a kitty to new owner
 		#[weight = 1000]
-		pub fn transfer(origin, to: T::AccountId, kitty_id: T::KittyIndex) {
+		pub fn transfer(origin, to: T::AccountId, kitty_id: KittyIndexOf<T>) {
 			let sender = ensure_signed(origin)?;
 
-			Kitties::<T>::try_mutate_exists(sender.clone(), kitty_id, |kitty| -> DispatchResult {
-				if sender == to {
-					ensure!(kitty.is_some(), Error::<T>::InvalidKittyId);
-					return Ok(());
-				}
+			NftModule::<T>::transfer(&sender, &to, (Self::class_id(), kitty_id))?;
 
-				let kitty = kitty.take().ok_or(Error::<T>::InvalidKittyId)?;
-
-				Kitties::<T>::insert(&to, kitty_id, kitty);
-
+			if sender != to {
+				KittyPrices::<T>::remove(kitty_id);
 				Self::deposit_event(RawEvent::KittyTransferred(sender, to, kitty_id));
+			}
+		}
 
-				Ok(())
+		/// Set a price for a kitty for sale
+		/// None to delist the kitty
+		#[weight = 1000]
+		pub fn set_price(origin, kitty_id: KittyIndexOf<T>, new_price: Option<BalanceOf<T>>) {
+			let sender = ensure_signed(origin)?;
+
+			ensure!(orml_nft::TokensByOwner::<T>::contains_key(&sender, (Self::class_id(), kitty_id)), Error::<T>::NotOwner);
+
+			KittyPrices::<T>::mutate_exists(kitty_id, |price| *price = new_price);
+
+			Self::deposit_event(RawEvent::KittyPriceUpdated(sender, kitty_id, new_price));
+		}
+
+		/// Buy a kitty
+		#[weight = 1000]
+		pub fn buy(origin, owner: T::AccountId, kitty_id: KittyIndexOf<T>, max_price: BalanceOf<T>) {
+			let sender = ensure_signed(origin)?;
+
+			ensure!(sender != owner, Error::<T>::BuyFromSelf);
+
+			KittyPrices::<T>::try_mutate_exists(kitty_id, |price| -> DispatchResult {
+				let price = price.take().ok_or(Error::<T>::NotForSale)?;
+
+				ensure!(max_price >= price, Error::<T>::PriceTooLow);
+
+				with_transaction_result(|| {
+					NftModule::<T>::transfer(&owner, &sender, (Self::class_id(), kitty_id))?;
+					T::Currency::transfer(&sender, &owner, price, ExistenceRequirement::KeepAlive)?;
+
+					Self::deposit_event(RawEvent::KittySold(owner, sender, kitty_id, price));
+
+					Ok(())
+				})
 			})?;
 		}
 	}
@@ -153,11 +200,13 @@ pub fn combine_dna(dna_1: u8, dna_2: u8, selector: u8) -> u8 {
 }
 
 impl<T: Config> Module<T> {
-	fn get_next_kitty_id() -> sp_std::result::Result<T::KittyIndex, DispatchError> {
-		NextKittyId::<T>::try_mutate(|next_kitty_id| -> sp_std::result::Result<T::KittyIndex, DispatchError> {
-			let kitty_id = *next_kitty_id;
-			*next_kitty_id = next_kitty_id.checked_add(&One::one()).ok_or(Error::<T>::KittiesIdOverflow)?;
-			Ok(kitty_id)
+	fn kitties(owner: &T::AccountId, kitty_id: KittyIndexOf<T>) -> Option<Kitty> {
+		NftModule::<T>::tokens(Self::class_id(), kitty_id).and_then(|x| {
+			if x.owner == *owner {
+				Some(x.data)
+			} else {
+				None
+			}
 		})
 	}
 
@@ -169,4 +218,4 @@ impl<T: Config> Module<T> {
 		);
 		payload.using_encoded(blake2_128)
 	}
-}	
+}
